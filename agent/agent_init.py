@@ -95,6 +95,26 @@ def _warn_memory_provider_unavailable(name: str, reason: str = "") -> None:
     )
 
 
+def _pre_admit_provider(provider: object, platform) -> bool:
+    """Return False if *provider* vetoes activation for this runtime.
+
+    Invoked once per agent-init, after the provider is loaded and before
+    is_available().  Only ``platform is None`` is normalised to ``"cli"``
+    — every other value (including empty-string, False, 0, [], {}) is
+    forwarded unchanged so custom or malformed tags reach the provider.
+
+    Providers without ``pre_admit`` or with a non-callable ``pre_admit``
+    default-allow.  Callable ``pre_admit`` returning a falsey value denies.
+    Errors from ``pre_admit`` propagate; the caller's existing exception
+    handler in agent_init covers them.
+    """
+    pre_admit = getattr(provider, "pre_admit", None)
+    if not callable(pre_admit):
+        return True
+    effective_platform = "cli" if platform is None else platform
+    return bool(pre_admit(effective_platform, "primary"))
+
+
 def _ra():
     """Lazy reference to ``run_agent`` so callers can patch
     ``run_agent.OpenAI`` / ``run_agent.cleanup_vm`` / ... and have those
@@ -1863,9 +1883,10 @@ def init_agent(
                 from plugins.memory import load_memory_provider as _load_mem
                 agent._memory_manager = _MemoryManager()
                 _mp = _load_mem(_mem_provider_name)
-                if _mp and _mp.is_available():
+                _mp_admitted: bool = _mp is not None and _pre_admit_provider(_mp, platform)
+                if _mp_admitted and _mp.is_available():
                     agent._memory_manager.add_provider(_mp)
-                elif _mp is not None:
+                elif _mp is not None and _mp_admitted:
                     # Skip the (potentially expensive) unavailable_reason() call
                     # if we've already warned for this provider — the gateway
                     # builds a fresh AIAgent per message, so without this guard

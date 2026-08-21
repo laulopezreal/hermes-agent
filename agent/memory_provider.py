@@ -237,6 +237,28 @@ class MemoryProvider(ABC):
     def shutdown(self) -> None:
         """Clean shutdown — flush queues, close connections."""
 
+    # -- Pre-admission hook (override to opt in) -----------------------------
+
+    def pre_admit(self, platform: Any, agent_context: str) -> bool:
+        """Return False to veto activation for this runtime; default allows all.
+
+        Called after the provider module is discovered, imported, registered,
+        and constructed — but *before* :meth:`is_available` and before
+        :meth:`~agent.memory_manager.MemoryManager.initialize_all` invokes
+        :meth:`initialize`.
+
+        ``platform``: the caller normalizes ``None`` to ``"cli"``; all other
+        values (including empty-string, ``False``, ``0``, ``[]``, ``{}``) are
+        forwarded unchanged.
+
+        ``agent_context``: the agent-init call supplies ``"primary"`` as the
+        context value.  Subagent, cron, and flush context propagation is not
+        yet implemented; do not rely on receiving those values here.
+
+        MUST be fast and side-effect-free (no config reads, network, or file I/O).
+        """
+        return True
+
     # -- Optional hooks (override to opt in) ---------------------------------
 
     def on_turn_start(self, turn_number: int, message: str, **kwargs) -> None:
