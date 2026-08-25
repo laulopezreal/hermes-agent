@@ -10288,6 +10288,26 @@ def _dispatch_once_locked(
                 _per_profile_running[claimed.assignee] = (
                     _per_profile_running.get(claimed.assignee, 0) + 1
                 )
+        except ModelOverrideError as exc:
+            # A permanently-bad model override can never succeed on retry —
+            # the provider would answer the same 404/400 every time. Block
+            # the task immediately with the actionable catalog id instead of
+            # counting spawn failures and re-queuing it each tick.
+            try:
+                blocked = block_task(
+                    conn, claimed.id, reason=str(exc), kind="needs_input",
+                )
+            except Exception:
+                blocked = False
+            if blocked:
+                result.auto_blocked.append(claimed.id)
+            else:
+                auto = _record_spawn_failure(
+                    conn, claimed.id, str(exc),
+                    failure_limit=failure_limit,
+                )
+                if auto:
+                    result.auto_blocked.append(claimed.id)
         except Exception as exc:
             auto = _record_spawn_failure(
                 conn, claimed.id, str(exc),
@@ -10408,6 +10428,26 @@ def _dispatch_once_locked(
                 _per_profile_running[claimed.assignee] = (
                     _per_profile_running.get(claimed.assignee, 0) + 1
                 )
+        except ModelOverrideError as exc:
+            # A permanently-bad model override can never succeed on retry —
+            # the provider would answer the same 404/400 every time. Block
+            # the task immediately with the actionable catalog id instead of
+            # counting spawn failures and re-queuing it each tick.
+            try:
+                blocked = block_task(
+                    conn, claimed.id, reason=str(exc), kind="needs_input",
+                )
+            except Exception:
+                blocked = False
+            if blocked:
+                result.auto_blocked.append(claimed.id)
+            else:
+                auto = _record_spawn_failure(
+                    conn, claimed.id, str(exc),
+                    failure_limit=failure_limit,
+                )
+                if auto:
+                    result.auto_blocked.append(claimed.id)
         except Exception as exc:
             auto = _record_spawn_failure(
                 conn, claimed.id, str(exc),
@@ -10706,6 +10746,169 @@ def _retag_legacy_worker_sessions(workspaces_root_path: str) -> None:
         _log.debug("kanban worker: legacy session retag skipped (%s)", exc)
 
 
+class ModelOverrideError(ValueError):
+    """A Kanban task's ``model_override`` cannot be resolved at dispatch.
+
+    This is a permanent, deterministic misconfiguration: the provider would
+    answer the same 404/400 on every retry, so spawning a worker would just
+    burn its turn budget on the same rejection. The dispatcher blocks the
+    task immediately (``kind="needs_input"``) with an actionable message
+    instead of counting spawn failures and re-queuing it every tick.
+    """
+
+
+def _provider_catalog_ids(provider: str) -> list[str]:
+    """All model ids the catalog knows for ``provider`` (static + manifest).
+
+    Merges the in-repo curated snapshot (``hermes_cli.models._PROVIDER_MODELS``)
+    with the docs-hosted model-catalog manifest, read from its on-disk cache
+    only — this never triggers a network fetch, so the dispatcher's hot path
+    stays offline and deterministic. Returns ``[]`` when nothing is known
+    (unknown provider, no cache), in which case callers fail open.
+    """
+    ids: set[str] = set()
+    try:
+        from hermes_cli.models import _PROVIDER_MODELS
+
+        for mid in _PROVIDER_MODELS.get(provider, []):
+            if isinstance(mid, str) and mid.strip():
+                ids.add(mid.strip())
+    except Exception:
+        pass
+    try:
+        from hermes_cli.model_catalog import _read_disk_cache
+
+        data, _mtime = _read_disk_cache()
+        block = (data or {}).get("providers", {}).get(provider, {})
+        for m in block.get("models", []):
+            if isinstance(m, dict):
+                mid = str(m.get("id") or "").strip()
+                if mid:
+                    ids.add(mid)
+    except Exception:
+        pass
+    return sorted(ids)
+
+
+def _catalog_entry_lookup(catalog: list[str], lower_name: str) -> Optional[str]:
+    """Return the catalog id whose ``lower()`` equals ``lower_name``, or None."""
+    for entry in catalog:
+        if entry.lower() == lower_name:
+            return entry
+    return None
+
+
+def _suffix_matches(entry: str, needle_lower: str) -> bool:
+    """True when ``entry`` equals ``needle_lower`` or its ``vendor/`` suffix does."""
+    if "/" not in entry:
+        return entry.lower() == needle_lower
+    return entry.split("/", 1)[1].lower() == needle_lower
+
+
+def _model_override_suggestion(provider: str, name: str, catalog: list[str]) -> str:
+    """Actionable text for an unknown model override: the catalog ids to use.
+
+    Narrows to the model's detected vendor when one is recognizable (so the
+    operator sees the ``deepseek/…`` entries, not all 31 Nous models).
+    """
+    narrowed = catalog
+    try:
+        from hermes_cli.model_normalize import detect_vendor
+
+        vendor = detect_vendor(name)
+        if vendor:
+            narrowed = [
+                e for e in catalog
+                if e.split("/", 1)[0].lower() == vendor.lower()
+            ]
+    except Exception:
+        pass
+    if not narrowed:
+        narrowed = catalog
+    if len(narrowed) <= 12:
+        ids = ", ".join(f"'{e}'" for e in narrowed)
+    else:
+        ids = ", ".join(f"'{e}'" for e in narrowed[:12]) + f", ... ({len(narrowed)} total)"
+    return f"The {provider} catalog knows: {ids}. Use the exact catalog id for this provider."
+
+
+def resolve_model_override_for_spawn(
+    model: str,
+    provider: Optional[str],
+) -> str:
+    """Resolve a Kanban task's ``model_override`` before the worker spawns.
+
+    Returns the model id the worker should receive, and raises
+    :class:`ModelOverrideError` when the id is definitely not in the
+    provider's catalog:
+
+    * **Provider unknown** (``None``) — the worker resolves the model
+      against its profile's configured provider, which may be a native
+      provider that wants a bare name. The model passes through untouched.
+    * **Bare id on an aggregator** (``deepseek-v4-flash`` on ``nous``) —
+      resolved to the single catalog entry whose suffix matches
+      (``deepseek/deepseek-v4-flash``), so a strict aggregator never
+      receives a bare id and answers a content-free 404 (the incident that
+      motivated this: t_142019ca burned a whole worker run that way).
+    * **Already-prefixed id in the catalog** — passed through with the
+      catalog's canonical casing.
+    * **Prefixed id on a native provider** — the matching provider prefix is
+      stripped back to the bare catalog id (``deepseek/deepseek-v4-flash`` on
+      the ``deepseek`` provider → ``deepseek-v4-flash``).
+    * **No match + catalog available** — raises ``ModelOverrideError`` naming
+      the catalog ids the operator can pick from.
+    * **No catalog data at all** — passes through unchanged (fail open:
+      absence from a curated snapshot is not proof a model is invalid).
+
+    ``provider`` should already be the effective provider the worker will use
+    (the task's ``provider_override``, else the assignee profile's configured
+    provider); it is normalized defensively here.
+    """
+    name = (model or "").strip()
+    if not name or not provider:
+        return model
+    try:
+        from hermes_cli.models import normalize_provider
+
+        provider = normalize_provider(provider) or provider
+    except Exception:
+        pass
+
+    catalog = _provider_catalog_ids(provider)
+    if not catalog:
+        # No catalog to judge against — can't tell a typo from a valid model
+        # the curated snapshot simply doesn't know. Fail open.
+        return model
+
+    lower = name.lower()
+    exact = _catalog_entry_lookup(catalog, lower)
+    if exact is not None:
+        return exact  # already a known id (bare or prefixed) — canonical casing
+
+    if "/" in name:
+        # A prefixed id the catalog doesn't know exactly. For an aggregator
+        # catalog, allow a wrong vendor prefix only when the bare suffix is
+        # unambiguous; for a native catalog, strip the prefix and require the
+        # bare remainder to be the known native id.
+        suffix = name.split("/", 1)[1].strip().lower()
+    else:
+        suffix = lower
+    matches = {e for e in catalog if _suffix_matches(e, suffix)}
+
+    if len(matches) == 1:
+        return matches.pop()
+    if len(matches) > 1:
+        raise ModelOverrideError(
+            f"Model override {name!r} is ambiguous for provider {provider!r}: "
+            f"it matches {sorted(matches)}. Pick one of those catalog ids, or "
+            "set --provider to the provider that serves the model you want."
+        )
+    raise ModelOverrideError(
+        f"Model override {name!r} is not a known {provider} model. "
+        f"{_model_override_suggestion(provider, name, catalog)}"
+    )
+
+
 def _default_spawn(
     task: Task,
     workspace: str,
@@ -10751,8 +10954,10 @@ def _default_spawn(
     # profile-specific config entirely.  Fixes profile-scoped fallback_providers
     # being invisible to kanban workers.
     from hermes_cli.profiles import resolve_profile_env
+    profile_home: Optional[str] = None
     try:
-        env["HERMES_HOME"] = resolve_profile_env(profile_arg)
+        profile_home = resolve_profile_env(profile_arg)
+        env["HERMES_HOME"] = profile_home
     except FileNotFoundError:
         # Profile dir doesn't exist — defer resolution to the CLI's
         # _apply_profile_override() via HERMES_PROFILE (set below).
@@ -10858,7 +11063,22 @@ def _default_spawn(
             if sk:
                 cmd.extend(["--skills", sk])
     if task.model_override:
-        cmd.extend(["-m", task.model_override])
+        # Resolve a bare model id to its prefixed catalog id (and reject a
+        # truly unknown id) BEFORE the worker spawns, so a bad override
+        # fails fast at dispatch instead of burning a worker's turn budget
+        # on the provider's 404 ("Model not found") — see
+        # resolve_model_override_for_spawn. The effective provider is the
+        # task's provider_override, else the assignee profile's configured
+        # provider (the one the worker will actually resolve the model
+        # against).
+        _provider = task.provider_override
+        if _provider is None and profile_home:
+            try:
+                from hermes_cli.profiles import _read_config_model
+                _provider = _read_config_model(Path(profile_home))[1]
+            except Exception:
+                _provider = None
+        cmd.extend(["-m", resolve_model_override_for_spawn(task.model_override, _provider)])
         # Pin the provider too when the override names one, so the worker
         # resolves the model against the intended backend instead of the
         # profile's configured provider (mixing model X with provider Y is

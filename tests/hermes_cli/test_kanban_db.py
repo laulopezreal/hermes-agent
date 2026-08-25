@@ -1269,6 +1269,53 @@ def test_dispatch_max_in_progress_blocks_review_when_at_limit(
     assert review_task is not None
     assert review_task.status == "review"
 
+
+# dispatch_once — model override resolution blocks unknown
+# ---------------------------------------------------------------------------
+
+
+def test_dispatch_blocks_task_on_unknown_model_override(
+    kanban_home, all_assignees_spawnable, monkeypatch,
+):
+    """An unresolvable model override blocks the task at dispatch time
+    instead of spawning a doomed worker (regression for t_142019ca:
+    a bare model id that 404'd on Nous burned a full worker run)."""
+    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
+    spawned = []
+
+    class FakeProc:
+        pid = 99
+
+    def fake_popen(cmd, *args, **kwargs):
+        spawned.append(cmd)
+        return FakeProc()
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    # Pin the provider catalog to the static nous list (deterministic in
+    # the isolated test env). The unknown model is not in nous's catalog.
+    from hermes_cli.models import _PROVIDER_MODELS
+
+    monkeypatch.setattr(
+        kb, "_provider_catalog_ids",
+        lambda provider: _PROVIDER_MODELS.get(provider, []),
+    )
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="bad model", assignee="alice",
+            model_override="deepseek-v9-typo", provider_override="nous",
+        )
+        res = kb.dispatch_once(conn)
+        task = kb.get_task(conn, tid)
+
+    assert not res.spawned
+    assert not spawned  # no worker process was launched
+    assert tid in res.auto_blocked
+    assert task is not None
+    assert task.status == "blocked"
+    assert task.block_kind == "needs_input"
+
+
 # Review column dispatch
 # ---------------------------------------------------------------------------
 

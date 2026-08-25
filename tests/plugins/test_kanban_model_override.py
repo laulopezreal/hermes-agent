@@ -138,15 +138,109 @@ def _spawn_and_capture(monkeypatch, tmp_path, task):
 def test_spawn_passes_model_and_provider(monkeypatch, tmp_path, conn):
     tid = kb.create_task(
         conn, title="t", assignee="elias",
-        model_override="glm-5", provider_override="openrouter",
+        model_override="deepseek/deepseek-v4-flash", provider_override="nous",
     )
     task = kb.get_task(conn, tid)
     cmd = _spawn_and_capture(monkeypatch, tmp_path, task)
     i = cmd.index("-m")
-    assert cmd[i + 1] == "glm-5"
+    assert cmd[i + 1] == "deepseek/deepseek-v4-flash"
     j = cmd.index("--provider")
     assert j == i + 2
-    assert cmd[j + 1] == "openrouter"
+    assert cmd[j + 1] == "nous"
+
+
+def test_spawn_resolves_bare_model_to_prefixed_catalog_id(monkeypatch, tmp_path, conn):
+    """A bare model override is prefixed to its catalog id before the worker
+    spawns, so a strict aggregator (Nous) never receives a bare id and answers
+    a content-free 404 (regression for t_142019ca, where the worker burned its
+    full turn budget on ``deepseek-v4-flash`` → 404 'Model not found')."""
+    tid = kb.create_task(
+        conn, title="t", assignee="elias",
+        model_override="deepseek-v4-flash", provider_override="nous",
+    )
+    task = kb.get_task(conn, tid)
+    cmd = _spawn_and_capture(monkeypatch, tmp_path, task)
+    i = cmd.index("-m")
+    assert cmd[i + 1] == "deepseek/deepseek-v4-flash"
+    j = cmd.index("--provider")
+    assert cmd[j + 1] == "nous"
+
+
+def test_spawn_blocks_unknown_model_override(monkeypatch, tmp_path, conn):
+    """A model id that is definitely not in the provider's catalog fails fast
+    at dispatch (ModelOverrideError) instead of spawning a doomed worker."""
+    tid = kb.create_task(
+        conn, title="t", assignee="elias",
+        model_override="deepseek-v9-typo", provider_override="nous",
+    )
+    task = kb.get_task(conn, tid)
+    with pytest.raises(kb.ModelOverrideError):
+        _spawn_and_capture(monkeypatch, tmp_path, task)
+
+
+# ---------------------------------------------------------------------------
+# Dispatch-time model override resolution (bare → prefixed catalog id)
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_bare_model_to_prefixed_catalog_id(monkeypatch):
+    monkeypatch.setattr(
+        kb, "_provider_catalog_ids",
+        lambda provider: [
+            "deepseek/deepseek-v4-flash",
+            "deepseek/deepseek-v4-flash-0731",
+            "deepseek/deepseek-v4-pro",
+        ],
+    )
+    assert kb.resolve_model_override_for_spawn("deepseek-v4-flash", "nous") == "deepseek/deepseek-v4-flash"
+    # Prefixed known id passes through with the catalog's canonical casing.
+    assert kb.resolve_model_override_for_spawn("deepseek/deepseek-v4-flash", "nous") == "deepseek/deepseek-v4-flash"
+    assert kb.resolve_model_override_for_spawn("DeepSeek/deepseek-v4-flash", "nous") == "deepseek/deepseek-v4-flash"
+
+
+def test_resolve_native_provider_strips_matching_prefix(monkeypatch):
+    monkeypatch.setattr(
+        kb, "_provider_catalog_ids",
+        lambda provider: ["deepseek-v4-pro", "deepseek-v4-flash"],
+    )
+    # Native providers want a bare id: both forms collapse to it.
+    assert kb.resolve_model_override_for_spawn("deepseek-v4-flash", "deepseek") == "deepseek-v4-flash"
+    assert kb.resolve_model_override_for_spawn("deepseek/deepseek-v4-flash", "deepseek") == "deepseek-v4-flash"
+
+
+def test_resolve_unknown_model_raises_with_exact_catalog_id(monkeypatch):
+    monkeypatch.setattr(
+        kb, "_provider_catalog_ids",
+        lambda provider: ["deepseek/deepseek-v4-flash", "deepseek/deepseek-v4-pro"],
+    )
+    with pytest.raises(kb.ModelOverrideError) as ei:
+        kb.resolve_model_override_for_spawn("deepseek-v9-typo", "nous")
+    msg = str(ei.value)
+    assert "deepseek-v9-typo" in msg
+    # The exact catalog id to use is in the message.
+    assert "deepseek/deepseek-v4-flash" in msg
+
+
+def test_resolve_ambiguous_bare_model_raises(monkeypatch):
+    monkeypatch.setattr(
+        kb, "_provider_catalog_ids",
+        lambda provider: ["anthropic/claude-sonnet-5", "openai/claude-sonnet-5"],
+    )
+    with pytest.raises(kb.ModelOverrideError) as ei:
+        kb.resolve_model_override_for_spawn("claude-sonnet-5", "nous")
+    assert "ambiguous" in str(ei.value)
+
+
+def test_resolve_no_provider_passes_through():
+    assert kb.resolve_model_override_for_spawn("deepseek-v4-flash", None) == "deepseek-v4-flash"
+
+
+def test_resolve_empty_catalog_fails_open(monkeypatch):
+    """Absence from a curated snapshot is not proof a model is invalid — a
+    provider with no catalog data (e.g. OpenRouter in an offline env) passes
+    the override through unchanged instead of false-blocking it."""
+    monkeypatch.setattr(kb, "_provider_catalog_ids", lambda provider: [])
+    assert kb.resolve_model_override_for_spawn("totally-bogus-model", "openrouter") == "totally-bogus-model"
 
 
 # ---------------------------------------------------------------------------
