@@ -1128,6 +1128,14 @@ class Task:
     # Goal-loop turn budget for ``goal_mode`` workers. ``None`` falls
     # through to the goals engine default (``goals.DEFAULT_MAX_TURNS``).
     goal_max_turns: Optional[int] = None
+    # Per-task iteration budget for the worker's agent loop. Overrides the
+    # profile-global ``agent.max_turns`` for THIS card only (passed to the
+    # worker as ``--max-turns N`` at spawn), so one deep card can get more
+    # turns without inflating every other worker on the profile. NULL = the
+    # worker uses its profile default. Set/adjusted after creation via
+    # ``hermes kanban set-budget <task> <N>``; survives re-dispatch because
+    # it lives on the task row.
+    max_turns: Optional[int] = None
     # Originating chat/agent session id, when the task was created from
     # within an agent loop that propagated ``HERMES_SESSION_ID``. NULL for
     # tasks created from the CLI, the dashboard, or any path that doesn't
@@ -1223,6 +1231,9 @@ class Task:
             ),
             goal_max_turns=(
                 row["goal_max_turns"] if "goal_max_turns" in keys and row["goal_max_turns"] else None
+            ),
+            max_turns=(
+                row["max_turns"] if "max_turns" in keys and row["max_turns"] else None
             ),
             session_id=(
                 row["session_id"] if "session_id" in keys else None
@@ -1404,6 +1415,10 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- Goal-loop turn budget for ``goal_mode`` workers. NULL = use the
     -- goals-engine default.
     goal_max_turns       INTEGER,
+    -- Per-task worker iteration budget. Overrides the profile-global
+    -- ``agent.max_turns`` for this card only (spawn passes ``--max-turns N``).
+    -- NULL = worker uses its profile default.
+    max_turns            INTEGER,
     -- Originating chat/agent session id when the task was created from
     -- inside an agent loop that propagated ``HERMES_SESSION_ID``. NULL
     -- for tasks created from the CLI, dashboard, or any path that doesn't
@@ -2654,6 +2669,14 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             conn, "tasks", "goal_max_turns", "goal_max_turns INTEGER"
         )
 
+    if "max_turns" not in cols:
+        # Per-task worker iteration budget (overrides profile-global
+        # agent.max_turns for this card only). NULL = profile default,
+        # preserving the behaviour existing rows had before the column.
+        _add_column_if_missing(
+            conn, "tasks", "max_turns", "max_turns INTEGER"
+        )
+
     if "session_id" not in cols:
         # Originating agent/chat session id, populated when the task is
         # created from within an agent loop that propagated
@@ -3178,6 +3201,7 @@ def create_task(
     reasoning_effort: Optional[str] = None,
     goal_mode: bool = False,
     goal_max_turns: Optional[int] = None,
+    max_turns: Optional[int] = None,
     initial_status: str = "running",
     session_id: Optional[str] = None,
     board: Optional[str] = None,
@@ -3497,8 +3521,9 @@ def create_task(
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
-                        goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_max_turns, session_id,
+                        max_turns
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3524,6 +3549,7 @@ def create_task(
                         1 if goal_mode else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
+                        int(max_turns) if max_turns is not None else None,
                     ),
                 )
                 for pid in parents:
@@ -3779,6 +3805,49 @@ def set_model_override(
         )
     # Task-mutation observer (RFC #58548), fired AFTER the txn commits.
     notify_task_updated(conn, task_id, ("model_override", "provider_override"))
+    return True
+
+
+def set_max_turns(
+    conn: sqlite3.Connection,
+    task_id: str,
+    max_turns: Optional[int],
+) -> bool:
+    """Set (or clear) the per-task worker iteration budget.
+
+    ``max_turns=None`` clears the override — the worker falls back to its
+    profile's global ``agent.max_turns`` (i.e. every other card keeps the
+    default). A positive int caps THIS card's worker at that many tool-calling
+    iterations, regardless of what the profile-global config says, so one deep
+    card can get more turns without inflating the budget for every other
+    worker on the profile.
+
+    Allowed on any non-archived task, including ``running`` ones — the budget
+    only takes effect on the NEXT dispatch (survives re-dispatch because it
+    lives on the task row). Returns True on success.
+    """
+    if max_turns is not None:
+        max_turns = int(max_turns)
+        if max_turns <= 0:
+            max_turns = None
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if not row:
+            return False
+        if row["status"] == "archived":
+            raise RuntimeError(f"cannot set turn budget on archived task {task_id}")
+        conn.execute(
+            "UPDATE tasks SET max_turns = ? WHERE id = ?",
+            (max_turns, task_id),
+        )
+        _append_event(
+            conn, task_id, "max_turns_set",
+            {"max_turns": max_turns},
+        )
+    # Task-mutation observer (RFC #58548), fired AFTER the txn commits.
+    notify_task_updated(conn, task_id, ("max_turns",))
     return True
 
 
@@ -10877,6 +10946,13 @@ def _default_spawn(
         "chat",
         "-q", prompt,
     ])
+    # Per-task iteration budget: the CLI-arg form of `--max-turns` has the
+    # highest precedence in the worker's turn-limit resolution (CLI arg >
+    # config > env), so a card-level override wins over the profile-global
+    # agent.max_turns for THIS worker only. Absent = worker keeps the profile
+    # default, so every other card is untouched.
+    if task.max_turns:
+        cmd.extend(["--max-turns", str(int(task.max_turns))])
     if task.goal_mode:
         # Goal-mode workers must take the fully-quiet single-query path:
         # the kanban goal-loop hook (_run_kanban_goal_loop_q) only runs in

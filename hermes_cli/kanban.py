@@ -76,6 +76,7 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "result": t.result,
         "skills": list(t.skills) if t.skills else [],
         "max_retries": t.max_retries,
+        "max_turns": t.max_turns,
         "model_override": t.model_override,
         "provider_override": t.provider_override,
         "session_id": t.session_id,
@@ -393,6 +394,13 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                           metavar="N", dest="goal_max_turns",
                           help="Turn budget for --goal workers (default 20). "
                                "Ignored without --goal.")
+    p_create.add_argument("--max-turns", type=int, default=None,
+                          metavar="N", dest="max_turns",
+                          help="Per-task worker iteration budget: caps THIS "
+                               "card's worker at N tool-calling turns, "
+                               "overriding the profile-global agent.max_turns "
+                               "for this card only. Adjustable later via "
+                               "`kanban set-budget <task> <N>`.")
     p_create.add_argument("--initial-status",
                           choices=sorted(kb.VALID_INITIAL_STATUSES),
                           default="running",
@@ -493,6 +501,20 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         "--provider", default=None,
         help="Provider the model belongs to (worker is spawned with "
              "--provider <name>). Cleared together with the model.",
+    )
+
+    # --- set-budget (per-task turn budget override) ---
+    p_set_budget = sub.add_parser(
+        "set-budget",
+        help="Set or clear a task's per-task turn budget "
+             "(takes effect on the next dispatch)",
+    )
+    p_set_budget.add_argument("task_id")
+    p_set_budget.add_argument(
+        "budget", nargs="?", default=None,
+        help="Max tool-calling turns for this card's worker, overriding the "
+             "profile-global agent.max_turns for this card only (or 'none' / "
+             "'0' / 'unlimited' to clear and use the profile default)",
     )
 
     # --- reclaim / reassign (recovery) ---
@@ -1114,6 +1136,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "show":     _cmd_show,
             "assign":   _cmd_assign,
             "set-model": _cmd_set_model,
+            "set-budget": _cmd_set_budget,
             "reclaim":  _cmd_reclaim,
             "reassign": _cmd_reassign,
             "diagnostics": _cmd_diagnostics,
@@ -1585,6 +1608,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             provider_override=getattr(args, "provider_override", None),
             goal_mode=bool(getattr(args, "goal_mode", False)),
             goal_max_turns=getattr(args, "goal_max_turns", None),
+            max_turns=getattr(args, "max_turns", None),
             initial_status=getattr(args, "initial_status", "running"),
         )
         task = kb.get_task(conn, task_id)
@@ -1762,6 +1786,10 @@ def _cmd_show(args: argparse.Namespace) -> int:
     if task.model_override:
         _prov = f" (provider: {task.provider_override})" if task.provider_override else ""
         print(f"  model:     {task.model_override}{_prov}")
+    if task.max_turns is not None:
+        print(f"  max-turns: {task.max_turns} (task)")
+    if task.goal_max_turns is not None:
+        print(f"  goal-turns: {task.goal_max_turns} (task)")
     # Effective retry threshold. Show the per-task override if set,
     # otherwise the dispatcher's resolved value from config (or the
     # default if config doesn't set it either). Helps operators see
@@ -1890,6 +1918,48 @@ def _cmd_set_model(args: argparse.Namespace) -> int:
     else:
         print(f"Cleared model override on {args.task_id} "
               "(worker uses its profile default)")
+    return 0
+
+
+def _cmd_set_budget(args: argparse.Namespace) -> int:
+    raw = getattr(args, "budget", None)
+    budget = None
+    if raw is not None:
+        s = str(raw).strip().lower()
+        # "unlimited" is a real per-task value (no iteration cap for this
+        # card); every other "clear" spelling reverts to the profile default.
+        if s in {"unlimited", "infinite", "infinity", "inf"}:
+            from hermes_cli.config import TURN_LIMIT_UNLIMITED
+            budget = TURN_LIMIT_UNLIMITED
+        elif s in {"none", "null", "-", "", "0"}:
+            budget = None
+        else:
+            try:
+                budget = int(s)
+            except ValueError:
+                print(
+                    f"kanban: invalid budget {raw!r} (expected a positive "
+                    "integer, 'unlimited', or 'none' to clear)",
+                    file=sys.stderr,
+                )
+                return 2
+            if budget <= 0:
+                budget = None
+    try:
+        with kb.connect_closing() as conn:
+            ok = kb.set_max_turns(conn, args.task_id, budget)
+    except (ValueError, RuntimeError) as exc:
+        print(f"kanban: {exc}", file=sys.stderr)
+        return 2
+    if not ok:
+        print(f"no such task: {args.task_id}", file=sys.stderr)
+        return 1
+    if budget is None:
+        print(f"Cleared turn budget on {args.task_id} "
+              "(worker uses its profile default)")
+    else:
+        print(f"Set turn budget on {args.task_id}: {budget} "
+              "(applies on next dispatch)")
     return 0
 
 
